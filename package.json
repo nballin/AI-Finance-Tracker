@@ -1,0 +1,19 @@
+{
+  "name": "ai-finance-tracker",
+  "version": "1.0.0",
+  "description": "Full-stack AI finance tracker with React, Node.js, and Python AI backend",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\" \"npm run dev:ai\"",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:ai": "cd ai-service && uvicorn main:app --reload --port 8001",
+    "install:all": "npm install && cd frontend && npm install && cd ../backend && npm install && cd ../ai-service && pip install -r requirements.txt"
+  },
+  "keywords": ["finance", "ai", "expense-tracker", "budget"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
+
