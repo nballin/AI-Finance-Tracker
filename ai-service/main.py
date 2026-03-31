@@ -1,4 +1,16 @@
-from fastapi import FastAPI, HTTPException
+"""
+AI Finance Tracker — FastAPI microservice.
+
+This service powers the chat assistant by:
+  1. Pulling expenses, budgets, and stats from the Node backend over HTTP.
+  2. Summarizing that data with pandas (totals, categories, monthly trends, budget vs actual).
+  3. Optionally augmenting replies with OpenAI when OPENAI_API_KEY is configured.
+
+Run with: python main.py (uvicorn on port 8001) or `uvicorn main:app --reload`.
+Environment: load from `.env` via python-dotenv (see env.example in repo).
+"""
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -9,22 +21,31 @@ import pandas as pd
 import httpx
 from datetime import datetime
 
+# Load variables from ai-service/.env (or process env) before reading OPENAI_API_KEY, etc.
 load_dotenv()
 
+# --- FastAPI app & CORS ----------------------------------------------------
+# Browser clients on other origins need CORS; permissive settings suit local dev.
 app = FastAPI(title="AI Finance Tracker Service")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Restrict in production to your frontend origin(s)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# OpenAI configuration - initialize only if API key is available
+# --- OpenAI client (lazy-safe: None when key missing or invalid) ------------
+
+
 def get_openai_client():
-    """Get OpenAI client, or None if API key is not set"""
+    """
+    Construct an OpenAI SDK client if a real API key is present.
+
+    Returns None when the key is unset, placeholder, or SDK init fails so callers
+    can fall back to rule-based / summary-only responses without crashing.
+    """
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key and api_key != "your_openai_api_key_here":
         try:
@@ -34,34 +55,47 @@ def get_openai_client():
             return None
     return None
 
+
 client = get_openai_client()
 
-# Database connection URL
+# --- External services (Node backend; Postgres URL reserved for future direct DB use) ---
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/finance_tracker")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:5001")
 
 
+# --- Request/response models for POST /chat ---------------------------------
+
+
 class ChatRequest(BaseModel):
+    """Inbound chat: user text plus optional prior turns for multi-turn context."""
+
     message: str
     conversation_history: Optional[List[dict]] = []
 
 
 class ChatResponse(BaseModel):
+    """Assistant reply as a single string (markdown/plain text from the model or fallback)."""
+
     response: str
 
 
 async def fetch_finance_data():
-    """Fetch expenses and budgets from the backend API"""
+    """
+    Load expenses, budgets, and aggregate stats from the main backend REST API.
+
+    Uses httpx async client for non-blocking I/O. Any failed request yields an empty
+    list/dict for that resource so analysis can still proceed partially.
+    """
     try:
         async with httpx.AsyncClient() as client:
             expenses_response = await client.get(f"{BACKEND_URL}/api/expenses")
             budgets_response = await client.get(f"{BACKEND_URL}/api/budgets")
             stats_response = await client.get(f"{BACKEND_URL}/api/stats")
-            
+
             expenses = expenses_response.json() if expenses_response.status_code == 200 else []
             budgets = budgets_response.json() if budgets_response.status_code == 200 else []
             stats = stats_response.json() if stats_response.status_code == 200 else {}
-            
+
             return expenses, budgets, stats
     except Exception as e:
         print(f"Error fetching finance data: {e}")
@@ -69,107 +103,114 @@ async def fetch_finance_data():
 
 
 def analyze_finances(expenses, budgets, stats):
-    """Analyze financial data using pandas"""
+    """
+    Turn raw expense/budget rows into a human-readable summary string for the LLM or fallback.
+
+    - Builds a DataFrame, normalizes date/amount types (API may send strings).
+    - Computes total spend, per-category breakdown with % of total, monthly totals.
+    - If budgets exist, compares current calendar month spend per category to budget caps.
+
+    stats is accepted for API symmetry but not yet merged into the text (backend may evolve).
+    """
     if not expenses:
         return "No expense data available."
-    
+
     try:
         df = pd.DataFrame(expenses)
-        # Convert date column
-        df['date'] = pd.to_datetime(df['date'])
-        # Convert amount column - handle both string and numeric types
-        df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
-        
+        # Parse ISO or similar date strings into datetime for grouping/resampling
+        df["date"] = pd.to_datetime(df["date"])
+        # Coerce bad/missing amounts to 0 so sum/groupby never propagates NaN silently
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+
         analysis = []
-        
-        # Total expenses
-        total_expenses = df['amount'].sum()
+
+        # --- Aggregate totals ---
+        total_expenses = df["amount"].sum()
         analysis.append(f"Total expenses: ${total_expenses:.2f}")
-        
-        # Expenses by category
-        category_totals = df.groupby('category')['amount'].sum().sort_values(ascending=False)
+
+        # --- Category mix (largest categories first) ---
+        category_totals = df.groupby("category")["amount"].sum().sort_values(ascending=False)
         analysis.append(f"\nExpenses by category:")
         for category, amount in category_totals.items():
             percentage = (amount / total_expenses) * 100
             analysis.append(f"  - {category}: ${amount:.2f} ({percentage:.1f}%)")
-        
-        # Monthly trend
-        df['month'] = df['date'].dt.to_period('M')
-        monthly_totals = df.groupby('month')['amount'].sum()
+
+        # --- Month-over-month totals (Period index for stable month labels) ---
+        df["month"] = df["date"].dt.to_period("M")
+        monthly_totals = df.groupby("month")["amount"].sum()
         analysis.append(f"\nMonthly spending trend:")
         for month, amount in monthly_totals.items():
             analysis.append(f"  - {month}: ${amount:.2f}")
-        
-        # Budget analysis
+
+        # --- Budget vs actual for the current month only ---
         if budgets:
             analysis.append(f"\nBudget status:")
             budget_df = pd.DataFrame(budgets)
             current_month = datetime.now().month
             current_year = datetime.now().year
-            
+
             for _, budget in budget_df.iterrows():
+                # Sum expenses in this category that fall in the current month/year
                 category_expenses = df[
-                    (df['category'] == budget['category']) &
-                    (df['date'].dt.month == current_month) &
-                    (df['date'].dt.year == current_year)
-                ]['amount'].sum()
-                
-                budget_amount = float(budget['amount']) if isinstance(budget['amount'], str) else budget['amount']
+                    (df["category"] == budget["category"])
+                    & (df["date"].dt.month == current_month)
+                    & (df["date"].dt.year == current_year)
+                ]["amount"].sum()
+
+                budget_amount = float(budget["amount"]) if isinstance(budget["amount"], str) else budget["amount"]
                 remaining = budget_amount - category_expenses
                 status = "OVER BUDGET" if category_expenses > budget_amount else "within budget"
                 analysis.append(
                     f"  - {budget['category']}: ${category_expenses:.2f} / ${budget_amount:.2f} ({status})"
                 )
-        
+
         return "\n".join(analysis)
     except Exception as e:
         return f"Error analyzing finances: {str(e)}. Basic stats: {len(expenses)} expenses found."
 
 
 def generate_ai_response(user_message: str, finance_analysis: str, conversation_history: List[dict]) -> str:
-    """Generate AI response using OpenAI"""
+    """
+    Build chat messages and call OpenAI chat completions, or return a no-key / error fallback.
+
+    Message order: system (persona) → last 5 history turns → system (injected finance snapshot) → user.
+    Truncating history limits token use and keeps focus on recent context.
+    """
     try:
-        # Check if OpenAI API key is set
+        # Explicit placeholder check mirrors get_openai_client() so we message clearly in .env
         if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "your_openai_api_key_here":
             return """I'm your AI finance assistant! To enable AI features, please add your OpenAI API key to the ai-service/.env file.
             
 For now, here's what I can tell you about your finances:
 """ + finance_analysis
-        
-        # Build context from conversation history
+
         messages = [
             {
                 "role": "system",
                 "content": """You are a helpful AI finance assistant. You help users track expenses, manage budgets, 
                 and provide personalized financial insights. Be concise, friendly, and actionable in your responses.
-                Use the provided financial data to answer questions accurately."""
+                Use the provided financial data to answer questions accurately.""",
             }
         ]
-        
-        # Add conversation history
-        for msg in conversation_history[-5:]:  # Keep last 5 messages for context
+
+        # Replay recent turns only — balances context vs. model context window and cost
+        for msg in conversation_history[-5:]:
             if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                messages.append({
-                    "role": msg.get("role", "user"),
-                    "content": msg.get("content", "")
-                })
-        
-        # Add current financial context
+                messages.append(
+                    {
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content", ""),
+                    }
+                )
+
+        # Second system message: fresh snapshot each request so answers reflect latest fetch
         if finance_analysis:
-            messages.append({
-                "role": "system",
-                "content": f"Current financial data:\n{finance_analysis}"
-            })
-        
-        # Add user message
-        messages.append({
-            "role": "user",
-            "content": user_message
-        })
-        
-        # Call OpenAI API
+            messages.append({"role": "system", "content": f"Current financial data:\n{finance_analysis}"})
+
+        messages.append({"role": "user", "content": user_message})
+
         if not client:
-            # Fallback response when OpenAI is not configured
+            # Client failed init earlier — still return analysis and setup instructions
             return f"""I'm your AI finance assistant! Here's your financial summary:
 
 {finance_analysis}
@@ -178,21 +219,22 @@ To enable full AI features, please add your OpenAI API key to the ai-service/.en
 OPENAI_API_KEY=your_api_key_here
 
 You can get an API key from https://platform.openai.com/api-keys"""
-        
+
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages,
             max_tokens=500,
-            temperature=0.7
+            temperature=0.7,
         )
-        
+
         return response.choices[0].message.content.strip()
-    
+
     except Exception as e:
         print(f"Error generating AI response: {e}")
         import traceback
+
         traceback.print_exc()
-        # Return helpful error message with finance analysis
+        # Always surface the pandas summary so the UI stays useful on API errors
         return f"""I encountered an error processing your request: {str(e)}
 
 However, here's your current financial summary:
@@ -206,44 +248,46 @@ To fix AI features, please check:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Handle chat requests with AI"""
+    """
+    Main entry: refresh finance data, analyze, then produce assistant text (LLM or fallback).
+
+    On unexpected errors, retries a minimal path (fetch + analyze) to return a useful message
+    instead of a bare 500 when possible.
+    """
     try:
-        # Fetch current finance data
         expenses, budgets, stats = await fetch_finance_data()
-        
-        # Analyze finances
         finance_analysis = analyze_finances(expenses, budgets, stats)
-        
-        # Generate AI response
         ai_response = generate_ai_response(
             request.message,
             finance_analysis,
-            request.conversation_history or []
+            request.conversation_history or [],
         )
-        
         return ChatResponse(response=ai_response)
-    
+
     except Exception as e:
         print(f"Error in chat endpoint: {e}")
         import traceback
+
         traceback.print_exc()
-        # Return error message instead of raising exception
         try:
             expenses, budgets, stats = await fetch_finance_data()
             finance_analysis = analyze_finances(expenses, budgets, stats)
             error_message = f"I encountered an error: {str(e)}\n\nHere's your financial summary:\n{finance_analysis}"
             return ChatResponse(response=error_message)
         except:
-            return ChatResponse(response=f"I encountered an error processing your request: {str(e)}. Please check the server logs.")
+            return ChatResponse(
+                response=f"I encountered an error processing your request: {str(e)}. Please check the server logs."
+            )
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
+    """Liveness/readiness probe for orchestrators and load balancers."""
     return {"status": "ok", "service": "ai-finance-tracker"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
 
+    # Bind 0.0.0.0 so the service is reachable from other containers/machines on the LAN
+    uvicorn.run(app, host="0.0.0.0", port=8001)
